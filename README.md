@@ -37,7 +37,7 @@
 6. 点击右上角 **Deploy** 保存代码
 
 ### 2. 创建 KV 存储（用于存储配置和运行时间）
-为实现配置持久化和随机运行间隔，需通过 KV 存储持久化配置和时间戳，步骤如下：
+为实现配置持久化和随机运行间隔，需通过 KV 存储持久化配置，步骤如下：
 1. 回到 Cloudflare 主面板，左侧菜单 → **Storage & Databases** → **KV**
 2. 点击 **Create Namespace**
 3. 自定义命名空间名称（例：`KeepAction`），点击 **Add** 完成创建
@@ -52,13 +52,9 @@
 4. 点击 **Deploy** 保存绑定
 
 ## ⏰ 第三步：设置 Worker 定时触发器（Triggers）
-脚本需每日检查「是否到达运行时间」，因此需配置 Cron 触发器实现定时执行，步骤如下：
 1. 回到 Worker 页面，点击 **Triggers** 选项卡
 2. 找到 **Cron Triggers** 区域，点击 **Add Cron Trigger**
-3. **Cron Expression**：建议设置**每天一次**，示例（可自定义时区）：
-   ```bash
-   0 9 * * *  # 每天上午9点执行（Cloudflare 默认 UTC 时区，需注意本地时间转换）
-   ```
+3. **Cron Expression**：建议设置**每月一次**
 4. 点击 **Add Trigger** 完成配置
 
 ## 🚀 第四步：访问前端界面
@@ -66,7 +62,7 @@
 2. 在浏览器中访问该 URL
 3. 首次访问会提示设置密码，输入你想要的密码
 4. 进入管理界面后，配置以下内容：
-   - **基础配置**：随机触发天数区间（TIME）、Telegram Token（TG_TOKEN）、Telegram 聊天ID（TG_ID）
+   - **基础配置**：Telegram Token（TG_TOKEN）、Telegram 聊天ID（TG_ID）
    - **GitHub 用户**：点击「+ 添加用户」，填写 GitHub 用户名（必须是真实的 GitHub 用户名）和 GitHub Token
    - **仓库配置**：每个用户下点击「+ 添加仓库」，填写 Repo、Workflow、Ref（Owner 会自动使用该 GitHub 用户的名字）
 5. 点击「💾 保存配置」保存设置
