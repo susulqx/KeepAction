@@ -1,29 +1,10 @@
 export default {
   async scheduled(event, env, ctx) {
-    console.log(`[Start] 唤醒 Worker...`);
-    
     const config = await this.loadConfig(env);
     if (!config) {
       console.log("❌ 未找到配置，跳过运行");
       return;
     }
-    
-    // 检查是否到达运行时间
-    if (env.KeepAction) {
-      const lastRun = await env.KeepAction.get("next_run_timestamp");
-      const now = Date.now();
-      
-      // 如果有记录，且当前时间 < 计划运行时间，则跳过
-      if (lastRun && now < parseInt(lastRun)) {
-        const waitMs = parseInt(lastRun) - now;
-        const waitDays = (waitMs / (1000 * 60 * 60 * 24)).toFixed(1);
-        console.log(`⏳ 还没到时间。计划: ${new Date(parseInt(lastRun)).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai"})} (余 ${waitDays} 天)`);
-        return;
-      }
-      
-      console.log("⏰ 时间已到 (或首次运行)，开始干活！");
-    }
-    
     await this.runKeepAlive(config, env);
   },
 
@@ -89,7 +70,6 @@ export default {
     if (!config) {
       const newConfig = {
         password: password,
-        time: "40-60",
         tgToken: "",
         tgId: "",
         users: []
@@ -141,7 +121,6 @@ export default {
     const currentConfig = await this.loadConfig(env);
     const newConfig = {
       ...currentConfig,
-      time: body.time,
       tgToken: body.tgToken,
       tgId: body.tgId,
       users: body.users
@@ -180,16 +159,6 @@ export default {
     let successCount = 0;
     let totalCount = 0;
     
-    let minDays = 40;
-    let maxDays = 60;
-    if (config.time) {
-      const parts = config.time.split('-');
-      if (parts.length === 2) {
-        minDays = parseInt(parts[0]) || 40;
-        maxDays = parseInt(parts[1]) || 60;
-      }
-    }
-    
     for (const user of config.users || []) {
       if (!user.token || !user.name) continue;
       
@@ -220,30 +189,19 @@ export default {
       }
     }
     
-    let nextRunDateStr = "未启用随机 (无KV)";
-    if (env.KeepAction) {
-      const randomDays = Math.floor(Math.random() * (maxDays - minDays + 1)) + minDays;
-      const nextRunTime = Date.now() + (randomDays * 24 * 60 * 60 * 1000);
-      
-      await env.KeepAction.put("next_run_timestamp", nextRunTime.toString());
-      nextRunDateStr = new Date(nextRunTime).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai"});
-    }
-    
     if (config.tgToken && config.tgId) {
       const message = [
         `🤖 <b>GitHub 保活任务报告</b>`,
         `-----------------------------`,
         ...report,
         `-----------------------------`,
-        `📊 <b>统计:</b> 成功 ${successCount} / 总计 ${totalCount}`,
-        `📅 <b>下一次:</b> ${nextRunDateStr}`,
-        `🎲 <b>区间:</b> ${minDays}-${maxDays} 天`
+        `📊 <b>统计:</b> 成功 ${successCount} / 总计 ${totalCount}`
       ].join("\n");
 
       await this.sendTelegramMessage(config.tgToken, config.tgId, message);
     }
     
-    return { report, successCount, totalCount, nextRunDateStr };
+    return { report, successCount, totalCount };
   },
 
   async sendTelegramMessage(token, chatId, text) {
@@ -458,10 +416,6 @@ export default {
         <div class="section">
           <h2 class="section-title">⚙️ 基础配置</h2>
           <div class="form-group">
-            <label>随机触发天数区间 (TIME)</label>
-            <input type="text" id="timeInput" placeholder="40-60">
-          </div>
-          <div class="form-group">
             <label>Telegram Bot Token (TG_TOKEN)</label>
             <input type="text" id="tgTokenInput" placeholder="123456:ABCdefxxxx">
           </div>
@@ -536,7 +490,6 @@ export default {
     }
     
     function renderConfig() {
-      document.getElementById('timeInput').value = config.time || '40-60';
       document.getElementById('tgTokenInput').value = config.tgToken || '';
       document.getElementById('tgIdInput').value = config.tgId || '';
       renderUsers();
@@ -635,7 +588,6 @@ export default {
     }
     
     async function saveConfig() {
-      config.time = document.getElementById('timeInput').value;
       config.tgToken = document.getElementById('tgTokenInput').value;
       config.tgId = document.getElementById('tgIdInput').value;
       
