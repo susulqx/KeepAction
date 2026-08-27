@@ -622,7 +622,7 @@ export default {
       if (data.success) {
         const resultBox = document.getElementById('resultBox');
         const resultContent = document.getElementById('resultContent');
-        resultContent.textContent = data.result.report.join('\\n') + \`\\n\\n统计: 成功 \${data.result.successCount} / 总计 \${data.result.totalCount}\\n下一次: \${data.result.nextRunDateStr}\`;
+        resultContent.textContent = data.result.report.join('\\n') + \`\\n\\n统计: 成功 \${data.result.successCount} / 总计 \${data.result.totalCount}\`;
         resultBox.classList.remove('hidden');
         showToast('执行完成！', 'success');
       } else {
