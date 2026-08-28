@@ -111,13 +111,6 @@
 
 
 
-## 📁 文件说明
-
-| 文件名 | 说明 |
-|--------|------|
-| `_worker.js` | Cloudflare Worker 主脚本，包含保活 + 同步功能 |
-| `sync-upstream.yml` | GitHub Actions 版同步工作流（旧方案，可选使用） |
-| `README.md` | 说明文档 |
 
 ---
 
