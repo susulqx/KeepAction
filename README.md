@@ -109,36 +109,7 @@
 
 5. 点击「💾 保存配置」保存所有设置
 
----
 
-## 🔄 上游同步功能说明
-
-### 工作原理
-Worker 直接通过 GitHub API 实现同步，替代了 yml 中的 git 命令：
-
-| yml 中的操作 | Worker 中的实现 |
-|-------------|---------------|
-| `git ls-remote upstream` | `GET /repos/{repo}/git/ref/heads/{branch}` 获取上游分支 SHA |
-| `git ls-remote target` | `GET /repos/{repo}/git/ref/heads/{branch}` 获取目标分支 SHA |
-| 对比 SHA 判断是否同步 | JS 对比字符串是否相等 |
-| `git push --force` | `PATCH /repos/{repo}/git/refs/heads/{branch}` 强制更新引用 |
-
-### 同步逻辑
-1. 获取上游仓库指定分支的最新 commit SHA
-2. 获取目标仓库指定分支的最新 commit SHA
-3. 如果两者相同，跳过同步
-4. 如果不同，强制更新目标仓库分支引用到上游的 SHA（等价于 force push）
-
-### Token 权限要求
-- 上游仓库：如果是公开仓库，Token 只需能读取即可
-- 目标仓库：Token 需要有 `repo` 或 `public_repo` 权限，能够写入分支
-
-### 注意事项
-- 该方式同步的是**分支引用**（即强制更新分支指向的 commit），适用于 fork 同步场景
-- 如果目标仓库有自己的提交，会被强制覆盖（等价于 `git push --force`）
-- 建议仅用于你自己的 fork 仓库同步上游
-
----
 
 ## 📁 文件说明
 
