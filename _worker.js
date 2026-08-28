@@ -5,7 +5,10 @@ export default {
       console.log("❌ 未找到配置，跳过运行");
       return;
     }
+    // 执行保活任务
     await this.runKeepAlive(config, env);
+    // 执行同步任务
+    await this.runSyncRepos(config, env);
   },
 
   async fetch(request, env, ctx) {
@@ -26,6 +29,10 @@ export default {
     
     if (path === "/api/run" && request.method === "POST") {
       return await this.handleRun(request, env);
+    }
+    
+    if (path === "/api/sync/run" && request.method === "POST") {
+      return await this.handleSyncRun(request, env);
     }
     
     return new Response(this.getHTML(), {
@@ -72,7 +79,8 @@ export default {
         password: password,
         tgToken: "",
         tgId: "",
-        users: []
+        users: [],
+        syncUsers: []
       };
       await this.saveConfigToKV(env, newConfig);
       return new Response(JSON.stringify({ success: true }), {
@@ -123,7 +131,8 @@ export default {
       ...currentConfig,
       tgToken: body.tgToken,
       tgId: body.tgId,
-      users: body.users
+      users: body.users || [],
+      syncUsers: body.syncUsers || []
     };
     
     await this.saveConfigToKV(env, newConfig);
@@ -163,9 +172,12 @@ export default {
       if (!user.token || !user.name) continue;
       
       for (const repo of user.repos || []) {
+        if (!repo.name) continue;
         totalCount++;
         try {
-          const url = `https://api.github.com/repos/${user.name}/${repo.name}/actions/workflows/${repo.workflow}/dispatches`;
+          const workflow = repo.workflow || "main.yml";
+          const ref = repo.ref || "main";
+          const url = `https://api.github.com/repos/${user.name}/${repo.name}/actions/workflows/${workflow}/dispatches`;
           
           const response = await fetch(url, {
             method: "POST",
@@ -174,7 +186,7 @@ export default {
               "Accept": "application/vnd.github.v3+json",
               "User-Agent": "CF-Worker-KeepAlive"
             },
-            body: JSON.stringify({ ref: repo.ref })
+            body: JSON.stringify({ ref: ref })
           });
 
           if (response.status === 204) {
@@ -189,7 +201,7 @@ export default {
       }
     }
     
-    if (config.tgToken && config.tgId) {
+    if (totalCount > 0 && config.tgToken && config.tgId) {
       const message = [
         `🤖 <b>GitHub 保活任务报告</b>`,
         `-----------------------------`,
@@ -202,6 +214,167 @@ export default {
     }
     
     return { report, successCount, totalCount };
+  },
+
+  async handleSyncRun(request, env) {
+    const isValid = await this.verifyPassword(request, env);
+    if (!isValid) {
+      return new Response(JSON.stringify({ success: false, message: "未授权" }), {
+        headers: { "Content-Type": "application/json" },
+        status: 401
+      });
+    }
+    
+    const config = await this.loadConfig(env);
+    if (!config) {
+      return new Response(JSON.stringify({ success: false, message: "未配置" }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    
+    const result = await this.runSyncRepos(config, env);
+    return new Response(JSON.stringify({ success: true, result }), {
+      headers: { "Content-Type": "application/json" }
+    });
+  },
+
+  // ========== 核心同步逻辑（对应 yml 中的 git 操作）==========
+  async runSyncRepos(config, env) {
+    const report = [];
+    let syncedCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+    let totalCount = 0;
+    
+    for (const user of config.syncUsers || []) {
+      if (!user.token || !user.name) continue;
+      
+      for (const repo of user.repos || []) {
+        if (!repo.name) continue;
+        totalCount++;
+        
+        const upstreamUser = repo.upstreamUser;
+        const upstreamRepo = repo.upstreamRepo;
+        const targetUser = user.name;
+        const targetRepo = repo.name;
+        const branch = repo.branch || "main";
+        const token = user.token;
+        
+        const upstreamFull = `${upstreamUser}/${upstreamRepo}`;
+        const targetFull = `${targetUser}/${targetRepo}`;
+        
+        if (!upstreamUser || !upstreamRepo) {
+          report.push(`❌ ${targetFull}: 上游仓库信息不完整`);
+          failedCount++;
+          continue;
+        }
+        
+        try {
+          // 1. 获取上游仓库分支的最新 SHA（对应 yml 里的 git ls-remote UPSTREAM_REPO）
+          const upstreamSha = await this.getBranchSha(upstreamFull, branch, token);
+          if (!upstreamSha) {
+            report.push(`❌ ${targetFull}: 上游仓库 ${upstreamFull} 的 ${branch} 分支不存在`);
+            failedCount++;
+            continue;
+          }
+          
+          // 2. 获取目标仓库分支的最新 SHA（对应 yml 里的 git ls-remote TARGET_URL）
+          const targetSha = await this.getBranchSha(targetFull, branch, token);
+          
+          // 3. 对比 SHA，判断是否需要同步
+          if (upstreamSha === targetSha) {
+            report.push(`⏭️ ${targetFull}: 已是最新，无需同步`);
+            skippedCount++;
+            continue;
+          }
+          
+          // 4. 强制更新目标仓库的分支引用（对应 yml 里的 git push --force）
+          const syncResult = await this.forceUpdateBranch(targetFull, branch, upstreamSha, token);
+          if (syncResult.success) {
+            report.push(`✅ ${targetFull}: 同步完成 ${targetSha.substring(0, 7)} → ${upstreamSha.substring(0, 7)}`);
+            syncedCount++;
+          } else {
+            report.push(`❌ ${targetFull}: 同步失败 - ${syncResult.message}`);
+            failedCount++;
+          }
+        } catch (err) {
+          report.push(`❌ ${targetFull}: 错误 - ${err.message}`);
+          failedCount++;
+        }
+      }
+    }
+    
+    // 发送 Telegram 通知
+    if (totalCount > 0 && config.tgToken && config.tgId) {
+      const message = [
+        `🔄 <b>上游仓库同步任务报告</b>`,
+        `-----------------------------`,
+        ...report,
+        `-----------------------------`,
+        `📊 <b>统计:</b> 已同步 ${syncedCount} / 跳过 ${skippedCount} / 失败 ${failedCount}`
+      ].join("\n");
+
+      await this.sendTelegramMessage(config.tgToken, config.tgId, message);
+    }
+    
+    return { report, syncedCount, skippedCount, failedCount, totalCount };
+  },
+
+  // 获取仓库分支的最新 commit SHA
+  async getBranchSha(repoFullName, branch, token) {
+    try {
+      const url = `https://api.github.com/repos/${repoFullName}/git/ref/heads/${branch}`;
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Accept": "application/vnd.github.v3+json",
+          "User-Agent": "CF-Worker-SyncUpstream"
+        }
+      });
+      
+      if (response.status === 404) {
+        return null;
+      }
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      
+      const data = await response.json();
+      return data.object.sha;
+    } catch (e) {
+      throw new Error(`获取分支 SHA 失败: ${e.message}`);
+    }
+  },
+
+  // 强制更新目标仓库分支引用到指定 SHA
+  async forceUpdateBranch(repoFullName, branch, sha, token) {
+    try {
+      const url = `https://api.github.com/repos/${repoFullName}/git/refs/heads/${branch}`;
+      const response = await fetch(url, {
+        method: "PATCH",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Accept": "application/vnd.github.v3+json",
+          "Content-Type": "application/json",
+          "User-Agent": "CF-Worker-SyncUpstream"
+        },
+        body: JSON.stringify({
+          sha: sha,
+          force: true
+        })
+      });
+      
+      if (response.ok) {
+        return { success: true };
+      } else {
+        const errorData = await response.json().catch(() => ({}));
+        return { success: false, message: errorData.message || `HTTP ${response.status}` };
+      }
+    } catch (e) {
+      return { success: false, message: e.message };
+    }
   },
 
   async sendTelegramMessage(token, chatId, text) {
@@ -308,6 +481,15 @@ export default {
       transform: translateY(-2px);
       box-shadow: 0 4px 12px rgba(76, 175, 80, 0.3);
     }
+    .btn-warning {
+      background: linear-gradient(135deg, #ffb74d 0%, #ffa726 100%);
+      color: white;
+    }
+    .btn-warning:hover {
+      background: linear-gradient(135deg, #ffa726 0%, #fb8c00 100%);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(251, 140, 0, 0.3);
+    }
     .btn-danger {
       background: linear-gradient(135deg, #e57373 0%, #ef5350 100%);
       color: white;
@@ -328,6 +510,11 @@ export default {
       display: flex;
       align-items: center;
       gap: 10px;
+    }
+    .section-desc {
+      color: #666;
+      font-size: 13px;
+      margin-bottom: 15px;
     }
     .user-card {
       border: 1px solid #bbdefb;
@@ -365,6 +552,14 @@ export default {
       gap: 12px;
       justify-content: flex-end;
       padding-top: 20px;
+      flex-wrap: wrap;
+    }
+    .section-action-bar {
+      display: flex;
+      gap: 10px;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 15px;
     }
     .hidden { display: none !important; }
     .toast {
@@ -393,13 +588,60 @@ export default {
       font-size: 13px;
       line-height: 1.6;
     }
+    .feature-section {
+      background: #fafcff;
+      border: 1px solid #e1f0fe;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+    .feature-section:last-child { margin-bottom: 0; }
+    .feature-title {
+      font-size: 16px;
+      color: #1565c0;
+      margin-bottom: 15px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 600;
+    }
+    .sync-item {
+      background: white;
+      border: 1px solid #e3f2fd;
+      border-radius: 8px;
+      padding: 15px;
+      margin-bottom: 10px;
+    }
+    .sync-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .sync-header span {
+      font-weight: 500;
+      color: #333;
+      font-size: 14px;
+    }
+    .sync-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .sync-arrow {
+      text-align: center;
+      color: #1976d2;
+      font-weight: 600;
+      padding: 5px 0;
+      font-size: 13px;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <h1>🤖 ZQ-KeepAction</h1>
-      <p>轻松管理您的 GitHub Actions 保活任务</p>
+      <p>轻松管理您的 GitHub Actions 保活与上游同步任务</p>
     </div>
     <div class="content">
       <div id="loginPage">
@@ -413,6 +655,7 @@ export default {
       </div>
       
       <div id="mainPage" class="hidden">
+        <!-- 基础配置 -->
         <div class="section">
           <h2 class="section-title">⚙️ 基础配置</h2>
           <div class="form-group">
@@ -425,20 +668,39 @@ export default {
           </div>
         </div>
         
-        <div class="section">
-          <h2 class="section-title">👥 GitHub 用户</h2>
-          <div id="usersList"></div>
-          <button class="btn btn-primary btn-sm" onclick="addUser()">+ 添加用户</button>
+        <!-- 保活功能 -->
+        <div class="feature-section">
+          <div class="feature-title">🛡 保活功能</div>
+          <p class="section-desc">触发 GitHub Actions Workflow，防止仓库因 60 天无活动被暂停</p>
+          <div id="keepAliveUsersList"></div>
+          <div class="section-action-bar">
+            <button class="btn btn-primary btn-sm" onclick="addKeepAliveUser()">+ 添加用户</button>
+            <button class="btn btn-success btn-sm" onclick="runKeepAlive()">🚀 执行保活</button>
+          </div>
+          <div id="keepAliveResultBox" class="result-box hidden">
+            <h3 style="margin-bottom:10px;">保活结果</h3>
+            <pre id="keepAliveResultContent"></pre>
+          </div>
         </div>
         
+        <!-- 同步功能 -->
+        <div class="feature-section">
+          <div class="feature-title">🔄 上游同步</div>
+          <p class="section-desc">直接通过 GitHub API 同步上游仓库分支到目标仓库（force push）</p>
+          <div id="syncUsersList"></div>
+          <div class="section-action-bar">
+            <button class="btn btn-primary btn-sm" onclick="addSyncUser()">+ 添加用户</button>
+            <button class="btn btn-warning btn-sm" onclick="runSyncRepos()">🔄 立即同步</button>
+          </div>
+          <div id="syncResultBox" class="result-box hidden">
+            <h3 style="margin-bottom:10px;">同步结果</h3>
+            <pre id="syncResultContent"></pre>
+          </div>
+        </div>
+        
+        <!-- 保存按钮 -->
         <div class="action-bar">
-          <button class="btn btn-success" onclick="runKeepAlive()">🚀 立即执行</button>
           <button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button>
-        </div>
-        
-        <div id="resultBox" class="result-box hidden">
-          <h3>执行结果</h3>
-          <pre id="resultContent"></pre>
         </div>
       </div>
     </div>
@@ -485,6 +747,8 @@ export default {
       const data = await res.json();
       if (data.success && data.config) {
         config = data.config;
+        if (!config.users) config.users = [];
+        if (!config.syncUsers) config.syncUsers = [];
         renderConfig();
       }
     }
@@ -492,11 +756,13 @@ export default {
     function renderConfig() {
       document.getElementById('tgTokenInput').value = config.tgToken || '';
       document.getElementById('tgIdInput').value = config.tgId || '';
-      renderUsers();
+      renderKeepAliveUsers();
+      renderSyncUsers();
     }
     
-    function renderUsers() {
-      const container = document.getElementById('usersList');
+    // ========== 保活用户渲染 ==========
+    function renderKeepAliveUsers() {
+      const container = document.getElementById('keepAliveUsersList');
       container.innerHTML = '';
       
       (config.users || []).forEach((user, userIndex) => {
@@ -506,27 +772,27 @@ export default {
           <div class="user-header">
             <div class="form-group" style="margin:0;flex:1;margin-right:15px;">
               <label>用户名</label>
-              <input type="text" value="\${user.name || ''}" onchange="updateUser(\${userIndex}, 'name', this.value)">
+              <input type="text" value="\${user.name || ''}" onchange="updateKeepAliveUser(\${userIndex}, 'name', this.value)">
             </div>
-            <button class="btn btn-danger btn-sm" onclick="removeUser(\${userIndex})">删除</button>
+            <button class="btn btn-danger btn-sm" onclick="removeKeepAliveUser(\${userIndex})">删除</button>
           </div>
           <div class="form-group">
             <label>GitHub Token</label>
-            <input type="password" value="\${user.token || ''}" placeholder="ghp_xxxxxxxxxx" onchange="updateUser(\${userIndex}, 'token', this.value)">
+            <input type="password" value="\${user.token || ''}" placeholder="ghp_xxxxxxxxxx" onchange="updateKeepAliveUser(\${userIndex}, 'token', this.value)">
           </div>
           <div style="margin-top:15px;">
             <h4 style="color:#1565c0;margin-bottom:10px;">📦 仓库列表</h4>
-            <div id="repos-\${userIndex}"></div>
-            <button class="btn btn-primary btn-sm" onclick="addRepo(\${userIndex})">+ 添加仓库</button>
+            <div id="keepAliveRepos-\${userIndex}"></div>
+            <button class="btn btn-primary btn-sm" onclick="addKeepAliveRepo(\${userIndex})">+ 添加仓库</button>
           </div>
         \`;
         container.appendChild(userDiv);
-        renderRepos(userIndex);
+        renderKeepAliveRepos(userIndex);
       });
     }
     
-    function renderRepos(userIndex) {
-      const container = document.getElementById(\`repos-\${userIndex}\`);
+    function renderKeepAliveRepos(userIndex) {
+      const container = document.getElementById(\`keepAliveRepos-\${userIndex}\`);
       container.innerHTML = '';
       
       const user = config.users[userIndex];
@@ -536,20 +802,20 @@ export default {
         repoDiv.innerHTML = \`
           <div class="repo-header">
             <span style="font-weight:500;color:#333;">\${user.name || ''}/\${repo.name || ''}</span>
-            <button class="btn btn-danger btn-sm" onclick="removeRepo(\${userIndex}, \${repoIndex})">删除</button>
+            <button class="btn btn-danger btn-sm" onclick="removeKeepAliveRepo(\${userIndex}, \${repoIndex})">删除</button>
           </div>
           <div class="repo-grid">
             <div class="form-group" style="margin:0;">
               <label>仓库名称</label>
-              <input type="text" value="\${repo.name || ''}" onchange="updateRepo(\${userIndex}, \${repoIndex}, 'name', this.value)">
+              <input type="text" value="\${repo.name || ''}" onchange="updateKeepAliveRepo(\${userIndex}, \${repoIndex}, 'name', this.value)">
             </div>
             <div class="form-group" style="margin:0;">
-              <label>Workflow 配置文件名</label>
-              <input type="text" value="\${repo.workflow || 'main.yml'}" onchange="updateRepo(\${userIndex}, \${repoIndex}, 'workflow', this.value)">
+              <label>Workflow 文件名</label>
+              <input type="text" value="\${repo.workflow || ''}" onchange="updateKeepAliveRepo(\${userIndex}, \${repoIndex}, 'workflow', this.value)">
             </div>
             <div class="form-group" style="margin:0;">
               <label>分支名称</label>
-              <input type="text" value="\${repo.ref || 'main'}" onchange="updateRepo(\${userIndex}, \${repoIndex}, 'ref', this.value)">
+              <input type="text" value="\${repo.ref || ''}" onchange="updateKeepAliveRepo(\${userIndex}, \${repoIndex}, 'ref', this.value)">
             </div>
           </div>
         \`;
@@ -557,34 +823,179 @@ export default {
       });
     }
     
-    function addUser() {
+    function addKeepAliveUser() {
       if (!config.users) config.users = [];
       config.users.push({ name: '', token: '', repos: [] });
-      renderUsers();
+      renderKeepAliveUsers();
     }
     
-    function removeUser(index) {
+    function removeKeepAliveUser(index) {
       config.users.splice(index, 1);
-      renderUsers();
+      renderKeepAliveUsers();
     }
     
-    function updateUser(index, field, value) {
+    function updateKeepAliveUser(index, field, value) {
       config.users[index][field] = value;
     }
     
-    function addRepo(userIndex) {
+    function addKeepAliveRepo(userIndex) {
       if (!config.users[userIndex].repos) config.users[userIndex].repos = [];
-      config.users[userIndex].repos.push({ name: '', workflow: 'main.yml', ref: 'main' });
-      renderRepos(userIndex);
+      config.users[userIndex].repos.push({ name: '', workflow: '', ref: '' });
+      renderKeepAliveRepos(userIndex);
     }
     
-    function removeRepo(userIndex, repoIndex) {
+    function removeKeepAliveRepo(userIndex, repoIndex) {
       config.users[userIndex].repos.splice(repoIndex, 1);
-      renderRepos(userIndex);
+      renderKeepAliveRepos(userIndex);
     }
     
-    function updateRepo(userIndex, repoIndex, field, value) {
+    function updateKeepAliveRepo(userIndex, repoIndex, field, value) {
       config.users[userIndex].repos[repoIndex][field] = value;
+    }
+    
+    // ========== 同步用户渲染 ==========
+    function renderSyncUsers() {
+      const container = document.getElementById('syncUsersList');
+      container.innerHTML = '';
+      
+      (config.syncUsers || []).forEach((user, userIndex) => {
+        const userDiv = document.createElement('div');
+        userDiv.className = 'user-card';
+        userDiv.innerHTML = \`
+          <div class="user-header">
+            <div class="form-group" style="margin:0;flex:1;margin-right:15px;">
+              <label>用户名</label>
+              <input type="text" value="\${user.name || ''}" onchange="updateSyncUser(\${userIndex}, 'name', this.value)">
+            </div>
+            <button class="btn btn-danger btn-sm" onclick="removeSyncUser(\${userIndex})">删除</button>
+          </div>
+          <div class="form-group">
+            <label>GitHub Token</label>
+            <input type="password" value="\${user.token || ''}" placeholder="ghp_xxxxxxxxxx" onchange="updateSyncUser(\${userIndex}, 'token', this.value)">
+          </div>
+          <div style="margin-top:15px;">
+            <h4 style="color:#1565c0;margin-bottom:10px;">📦 仓库列表</h4>
+            <div id="syncRepos-\${userIndex}"></div>
+            <button class="btn btn-primary btn-sm" onclick="addSyncRepo(\${userIndex})">+ 添加仓库</button>
+          </div>
+        \`;
+        container.appendChild(userDiv);
+        renderSyncRepos(userIndex);
+      });
+    }
+    
+    function renderSyncRepos(userIndex) {
+      const container = document.getElementById(\`syncRepos-\${userIndex}\`);
+      container.innerHTML = '';
+      
+      const user = config.syncUsers[userIndex];
+      (user.repos || []).forEach((repo, repoIndex) => {
+        const repoDiv = document.createElement('div');
+        repoDiv.className = 'repo-item';
+        const upstreamDisplay = (repo.upstreamUser && repo.upstreamRepo) 
+          ? \`\${repo.upstreamUser}/\${repo.upstreamRepo}\` 
+          : '上游仓库';
+        repoDiv.innerHTML = \`
+          <div class="repo-header">
+            <span style="font-weight:500;color:#333;">\${upstreamDisplay} → \${user.name || ''}/\${repo.name || ''}</span>
+            <button class="btn btn-danger btn-sm" onclick="removeSyncRepo(\${userIndex}, \${repoIndex})">删除</button>
+          </div>
+          <div class="repo-grid">
+            <div class="form-group" style="margin:0;">
+              <label>上游用户/组织</label>
+              <input type="text" value="\${repo.upstreamUser || ''}" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'upstreamUser', this.value)">
+            </div>
+            <div class="form-group" style="margin:0;">
+              <label>上游仓库名称</label>
+              <input type="text" value="\${repo.upstreamRepo || ''}" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'upstreamRepo', this.value)">
+            </div>
+            <div class="form-group" style="margin:0;">
+              <label>上游仓库分支</label>
+              <input type="text" value="\${repo.branch || ''}" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'branch', this.value)">
+            </div>
+            <div class="form-group" style="margin:0;">
+              <label>目标仓库名称</label>
+              <input type="text" value="\${repo.name || ''}" onchange="updateSyncRepo(\${userIndex}, \${repoIndex}, 'name', this.value)">
+            </div>
+          </div>
+        \`;
+        container.appendChild(repoDiv);
+      });
+    }
+    
+    function addSyncUser() {
+      if (!config.syncUsers) config.syncUsers = [];
+      config.syncUsers.push({ name: '', token: '', repos: [] });
+      renderSyncUsers();
+    }
+    
+    function removeSyncUser(index) {
+      config.syncUsers.splice(index, 1);
+      renderSyncUsers();
+    }
+    
+    function updateSyncUser(index, field, value) {
+      config.syncUsers[index][field] = value;
+    }
+    
+    function addSyncRepo(userIndex) {
+      if (!config.syncUsers[userIndex].repos) config.syncUsers[userIndex].repos = [];
+      config.syncUsers[userIndex].repos.push({ name: '', upstreamUser: '', upstreamRepo: '', branch: '' });
+      renderSyncRepos(userIndex);
+    }
+    
+    function removeSyncRepo(userIndex, repoIndex) {
+      config.syncUsers[userIndex].repos.splice(repoIndex, 1);
+      renderSyncRepos(userIndex);
+    }
+    
+    function updateSyncRepo(userIndex, repoIndex, field, value) {
+      config.syncUsers[userIndex].repos[repoIndex][field] = value;
+    }
+    
+    // ========== 执行函数 ==========
+    async function runKeepAlive() {
+      showToast('正在执行保活...', 'success');
+      
+      const res = await fetch('/api/run', {
+        method: 'POST',
+        headers: {
+          'Authorization': \`Bearer \${token}\`
+        }
+      });
+      
+      const data = await res.json();
+      if (data.success) {
+        const resultBox = document.getElementById('keepAliveResultBox');
+        const resultContent = document.getElementById('keepAliveResultContent');
+        resultContent.textContent = data.result.report.join('\\n') + \`\\n\\n统计: 成功 \${data.result.successCount} / 总计 \${data.result.totalCount}\`;
+        resultBox.classList.remove('hidden');
+        showToast('保活执行完成！', 'success');
+      } else {
+        showToast(data.message || '执行失败', 'error');
+      }
+    }
+    
+    async function runSyncRepos() {
+      showToast('正在同步...', 'success');
+      
+      const res = await fetch('/api/sync/run', {
+        method: 'POST',
+        headers: {
+          'Authorization': \`Bearer \${token}\`
+        }
+      });
+      
+      const data = await res.json();
+      if (data.success) {
+        const resultBox = document.getElementById('syncResultBox');
+        const resultContent = document.getElementById('syncResultContent');
+        resultContent.textContent = data.result.report.join('\\n') + \`\\n\\n统计: 已同步 \${data.result.syncedCount} / 跳过 \${data.result.skippedCount} / 失败 \${data.result.failedCount}\`;
+        resultBox.classList.remove('hidden');
+        showToast('同步完成！', 'success');
+      } else {
+        showToast(data.message || '同步失败', 'error');
+      }
     }
     
     async function saveConfig() {
@@ -605,28 +1016,6 @@ export default {
         showToast('保存成功！', 'success');
       } else {
         showToast('保存失败', 'error');
-      }
-    }
-    
-    async function runKeepAlive() {
-      showToast('正在执行...', 'success');
-      
-      const res = await fetch('/api/run', {
-        method: 'POST',
-        headers: {
-          'Authorization': \`Bearer \${token}\`
-        }
-      });
-      
-      const data = await res.json();
-      if (data.success) {
-        const resultBox = document.getElementById('resultBox');
-        const resultContent = document.getElementById('resultContent');
-        resultContent.textContent = data.result.report.join('\\n') + \`\\n\\n统计: 成功 \${data.result.successCount} / 总计 \${data.result.totalCount}\`;
-        resultBox.classList.remove('hidden');
-        showToast('执行完成！', 'success');
-      } else {
-        showToast(data.message || '执行失败', 'error');
       }
     }
     
